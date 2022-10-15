@@ -14,6 +14,79 @@ from ase.io import read
 
 ref_atoms = ase.io.read("POSCAR_Ni3Al")
 
+def wc_parameters(atoms, ref_atoms, solute):
+    """
+    Generates DataFrame containing Warren-Cowley parameters for all possible species pairs in an Atoms object
+    :param Atoms atoms: Atoms object to be analyzed
+    :param int min_threshold: Nth closest nearest neighbor to be considered
+    :param int max_threshold: Nth farthest nearest neighbor to be considered
+    :param Atoms ref_atoms: Pure Ni3Al Atoms object used to reference Ni/Al lattice sites
+    :param str solute: Element acting as alloy solute
+    :return: DataFrame of Warren-Crowley parameters for all species in `atoms`
+    Usage: wc_parameters(load_poscar("./11_NiAl_Ti", 8)[0]["POSCAR"][0], 1, 12, ref_atoms, "Ti")
+    """
+    ref_sublattice = np.array(ref_atoms.get_chemical_symbols())
+    ref_matrix = np.reshape(np.repeat(ref_atoms.get_positions(), 432), (432, 3, 432))
+    atoms_matrix = atoms.get_positions()[:, :, np.newaxis].T
+    atoms_sites = np.argmin(np.linalg.norm(atoms_matrix - ref_matrix, axis=1)[:, np.newaxis], axis=0).flatten()
+    atoms_sublattice = ref_sublattice[atoms_sites]
+    ni_lattice = atoms[atoms_sublattice == "Ni"]
+    al_lattice = atoms[atoms_sublattice == "Al"]
+    all_species = np.unique(atoms.get_chemical_symbols())
+    wc_outputs = []
+    subs = {"Ni":[ni_lattice, (1, 8)], "Al":[al_lattice, (1, 6)]}
+    for sublattice in subs:
+        sublattice_obj = subs[sublattice][0]
+        sublattice_species = sublattice_obj.get_chemical_symbols()
+        min_threshold, max_threshold = subs[sublattice][1]
+        neighbors = nearest_neighbors(sublattice_obj, min_threshold, max_threshold)
+        wc_values = np.zeros((len(neighbors), len(all_species)))
+        for i, species in enumerate(all_species):
+            c_j = np.mean(np.array(sublattice_species) == species)
+            wc_values[:, i] = np.apply_along_axis(lambda arr: warren_cowley(species, arr, c_j), 1, neighbors)
+        wc_df = pd.DataFrame(wc_values, columns = all_species)
+        wc_df["Species"] = sublattice_species
+        aggregated = wc_df.groupby("Species").mean().round(3)
+        for missing in all_species[~np.isin(all_species, aggregated.index)]:
+            aggregated[missing] = [np.nan]*len(aggregated)
+            aggregated.loc[missing, :] = [np.nan]*len(aggregated.columns)
+        wc_outputs.append(aggregated.sort_index())
+    return wc_outputs
+
+def process_wc(poscar_df, composition, nsolutes, distrib, ref_atoms, plot=True):
+    """
+    Generates DataFrame containing all 1-NN Warren-Cowley parameters for all Atoms objects in a given MC run and saves to csv
+    :param df poscar_df: DataFrame of POSCAR files for each MC run
+    :param str composition: Chemical composition of alloy to be analyzed
+    :param int nsolutes: Number of solute atoms in each Atoms object of `poscar_df`
+    :param str distrib: Distribution of solute species in alloy (eg 00, 01, etc)
+    :param Atoms ref_atoms: Atoms object used to reference Ni/Al lattice sites
+    :param bool plot: Flag to plot evolution of WC values
+    :return: DataFrame of all WC parameters across all time-steps of MC run
+    Usage: process_wc(load_poscar("./11_NiAl_Ti", 8)[0], "NiAl_Ti", 8, "00", 1, ase.io.read("POSCAR_Ni3Al"))
+    """
+    species = np.unique(poscar_df["POSCAR"][0].get_chemical_symbols())
+    upper_tri_indices = np.triu_indices(len(species))
+    wcs = np.zeros((len(poscar_df), 2*len(upper_tri_indices[0])))
+    for i in range(0, len(poscar_df)):
+        ni_al_wc = wc_parameters(poscar_df["POSCAR"][i], ref_atoms, species[(species!="Al")&(species!="Ni")][0])
+        ni_wc, al_wc = np.array(ni_al_wc[0]), np.array(ni_al_wc[1])
+        wcs[i, :int(wcs.shape[1]/2)] = ni_wc[upper_tri_indices]
+        wcs[i, int(wcs.shape[1]/2):] = al_wc[upper_tri_indices]
+    species_pair_df = ni_al_wc[0] #Arbitrarily grab wc df for column namings
+    ni_cols = [f"Ni Lattice {species_pair_df.index[pair[0]]}-{species_pair_df.columns[pair[1]]}" for pair in zip(upper_tri_indices[0], upper_tri_indices[1])]
+    al_cols = [f"Al Lattice {species_pair_df.index[pair[0]]}-{species_pair_df.columns[pair[1]]}" for pair in zip(upper_tri_indices[0], upper_tri_indices[1])]
+    wc_vals = pd.DataFrame(columns=ni_cols + al_cols, data=wcs)
+    output = poscar_df.merge(wc_vals, left_index=True, right_index=True)
+    if not os.path.exists('sublattice_data'):
+        os.mkdir('sublattice_data')
+    output.to_csv(os.path.join('sublattice_data', f'{composition}_{nsolutes}_{distrib}.csv'), index=False)
+    if plot:
+        ref_distrib = pd.Series(ref_atoms.get_chemical_symbols()).value_counts()
+        distrib_count = pd.Series(poscar_df["POSCAR"][0].get_chemical_symbols()).value_counts()
+        plot_wc_evolution(output, composition, nsolutes, distrib, distrib_count, ref_distrib)
+    return output
+    
 def load_poscar(composition, nsolutes):
     """
     Loads all POSCAR files for all distributions of a given alloy composition into DataFrames
@@ -106,78 +179,6 @@ def warren_cowley(j, neighbors_arr, c_j):
     """
     return 1 - np.mean(neighbors_arr == j)/c_j
 
-def wc_parameters(atoms, ref_atoms, solute):
-    """
-    Generates DataFrame containing Warren-Cowley parameters for all possible species pairs in an Atoms object
-    :param Atoms atoms: Atoms object to be analyzed
-    :param int min_threshold: Nth closest nearest neighbor to be considered
-    :param int max_threshold: Nth farthest nearest neighbor to be considered
-    :param Atoms ref_atoms: Pure Ni3Al Atoms object used to reference Ni/Al lattice sites
-    :param str solute: Element acting as alloy solute
-    :return: DataFrame of Warren-Crowley parameters for all species in `atoms`
-    Usage: wc_parameters(load_poscar("./11_NiAl_Ti", 8)[0]["POSCAR"][0], 1, 12, ref_atoms, "Ti")
-    """
-    ref_sublattice = np.array(ref_atoms.get_chemical_symbols())
-    ref_matrix = np.reshape(np.repeat(ref_atoms.get_positions(), 432), (432, 3, 432))
-    atoms_matrix = atoms.get_positions()[:, :, np.newaxis].T
-    atoms_sites = np.argmin(np.linalg.norm(atoms_matrix - ref_matrix, axis=1)[:, np.newaxis], axis=0).flatten()
-    atoms_sublattice = ref_sublattice[atoms_sites]
-    ni_lattice = atoms[atoms_sublattice == "Ni"]
-    al_lattice = atoms[atoms_sublattice == "Al"]
-    all_species = np.unique(atoms.get_chemical_symbols())
-    wc_outputs = []
-    subs = {"Ni":[ni_lattice, (1, 8)], "Al":[al_lattice, (1, 6)]}
-    for sublattice in subs:
-        sublattice_obj = subs[sublattice][0]
-        sublattice_species = sublattice_obj.get_chemical_symbols()
-        min_threshold, max_threshold = subs[sublattice][1]
-        neighbors = nearest_neighbors(sublattice_obj, min_threshold, max_threshold)
-        wc_values = np.zeros((len(neighbors), len(all_species)))
-        for i, species in enumerate(all_species):
-            c_j = np.mean(np.array(sublattice_species) == species)
-            wc_values[:, i] = np.apply_along_axis(lambda arr: warren_cowley(species, arr, c_j), 1, neighbors)
-        wc_df = pd.DataFrame(wc_values, columns = all_species)
-        wc_df["Species"] = sublattice_species
-        aggregated = wc_df.groupby("Species").mean().round(3)
-        for missing in all_species[~np.isin(all_species, aggregated.index)]:
-            aggregated[missing] = [np.nan]*len(aggregated)
-            aggregated.loc[missing, :] = [np.nan]*len(aggregated.columns)
-        wc_outputs.append(aggregated.sort_index())
-    return wc_outputs
-
-def process_wc(poscar_df, composition, nsolutes, distrib, ref_atoms, plot=True):
-    """
-    Generates DataFrame containing all 1-NN Warren-Cowley parameters for all Atoms objects in a given MC run and saves to csv
-    :param df poscar_df: DataFrame of POSCAR files for each MC run
-    :param str composition: Chemical composition of alloy to be analyzed
-    :param int nsolutes: Number of solute atoms in each Atoms object of `poscar_df`
-    :param str distrib: Distribution of solute species in alloy (eg 00, 01, etc)
-    :param Atoms ref_atoms: Atoms object used to reference Ni/Al lattice sites
-    :param bool plot: Flag to plot evolution of WC values
-    :return: DataFrame of all WC parameters across all time-steps of MC run
-    Usage: process_wc(load_poscar("./11_NiAl_Ti", 8)[0], "NiAl_Ti", 8, "00", 1, ase.io.read("POSCAR_Ni3Al"))
-    """
-    species = np.unique(poscar_df["POSCAR"][0].get_chemical_symbols())
-    upper_tri_indices = np.triu_indices(len(species))
-    wcs = np.zeros((len(poscar_df), 2*len(upper_tri_indices[0])))
-    for i in range(0, len(poscar_df)):
-        ni_al_wc = wc_parameters(poscar_df["POSCAR"][i], ref_atoms, species[(species!="Al")&(species!="Ni")][0])
-        ni_wc, al_wc = np.array(ni_al_wc[0]), np.array(ni_al_wc[1])
-        wcs[i, :int(wcs.shape[1]/2)] = ni_wc[upper_tri_indices]
-        wcs[i, int(wcs.shape[1]/2):] = al_wc[upper_tri_indices]
-    species_pair_df = ni_al_wc[0] #Arbitrarily grab wc df for column namings
-    ni_cols = [f"Ni Lattice {species_pair_df.index[pair[0]]}-{species_pair_df.columns[pair[1]]}" for pair in zip(upper_tri_indices[0], upper_tri_indices[1])]
-    al_cols = [f"Al Lattice {species_pair_df.index[pair[0]]}-{species_pair_df.columns[pair[1]]}" for pair in zip(upper_tri_indices[0], upper_tri_indices[1])]
-    wc_vals = pd.DataFrame(columns=ni_cols + al_cols, data=wcs)
-    output = poscar_df.merge(wc_vals, left_index=True, right_index=True)
-    if not os.path.exists('sublattice_data'):
-        os.mkdir('sublattice_data')
-    output.to_csv(os.path.join('sublattice_data', f'{composition}_{nsolutes}_{distrib}.csv'), index=False)
-    if plot:
-        ref_distrib = pd.Series(ref_atoms.get_chemical_symbols()).value_counts()
-        distrib_count = pd.Series(poscar_df["POSCAR"][0].get_chemical_symbols()).value_counts()
-        plot_wc_evolution(output, composition, nsolutes, distrib, distrib_count, ref_distrib)
-    return output
     
 
 def main():
